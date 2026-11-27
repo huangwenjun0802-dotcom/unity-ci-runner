@@ -1,0 +1,209 @@
+name: Unity Build (public free runner)
+
+on:
+  workflow_dispatch:
+    inputs:
+      note:
+        description: "构建备注（如 v40c）"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - name: 工作区迁移到 /mnt（Unity Library/Bee/APK 全落大盘，根分区只留系统）
+        run: |
+          W=/home/runner/work/unity-ci-runner
+          sudo mkdir -p /mnt/ws
+          sudo mv "$W" /mnt/ws/moon
+          sudo ln -sfn /mnt/ws/moon "$W"
+
+      - name: Free disk space（腾挪到 ~50GB：删预装工具链 + 清 docker；runner 只有单块 72GB 盘）
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache /usr/local/share/boost /usr/lib/jvm /usr/share/swift /usr/local/share/chromium /usr/local/lib/node_modules /usr/share/apache-maven* /usr/share/gradle* /usr/share/sbt /usr/share/kotlin /usr/share/rust /opt/hosted-pipelines || true
+          sudo docker image prune -af || true
+          sudo systemctl stop docker || true
+          sudo mkdir -p /mnt/docker
+          echo '{"data-root": "/mnt/docker"}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl start docker
+          sudo rm -rf /var/lib/docker || true
+          sudo swapoff -a || true
+          free -h
+          df -h / /mnt
+      - name: 拉取工程两包（自写代码+原版资产，URL 存于加密 Secret，仓库零公开）
+        env:
+          ENGINE_URL: ${{ secrets.ENGINE_ZIP_URL }}
+          EXPORT_URL: ${{ secrets.EXPORT_ZIP_URL }}
+        run: |
+          curl -sL --retry 3 "$ENGINE_URL" -o /tmp/ms-engine.zip
+          curl -sL --retry 3 "$EXPORT_URL" -o /tmp/exported_project.zip
+          ls -la /tmp/*.zip
+          unzip -q -o /tmp/exported_project.zip -x "Assets/Plugins/*"
+          unzip -q -o /tmp/ms-engine.zip
+          rm -f /tmp/*.zip
+          echo "资产文件数: $(find Assets -type f -not -path "Assets/Scripts/*" -not -path "Assets/Plugins/*" | wc -l)"
+          du -sh Assets
+          ls Assets/Scenes/
+      - name: 用真实现覆盖 dummy 着色器（GUID 不变，材质引用不断）
+        run: |
+          MISS=0
+          for f in tools/shaders/*; do
+            B=$(basename "$f")
+            if [ -f "Assets/Shader/$B" ]; then
+              cp "$f" "Assets/Shader/$B"
+            else
+              echo "缺失目标: $B"
+              MISS=1
+            fi
+          done
+          cp tools/shaders/TMPro_Properties.cginc Assets/Shader/ 2>/dev/null || true
+          echo "覆盖完成，缺失数=$MISS"
+          head -8 "Assets/Shader/Moon Cleaners_Lunar Rock.shader"
+      - name: Build in Unity container (activate -> build -> return seat)
+        env:
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+          TELE_TOKEN: ${{ secrets.UPLOAD_PAT }}
+        run: |
+          # 磁盘水位监控（诊断：谁在吃盘）
+          (for i in $(seq 1 150); do echo "$(date -u +%T) 根盘剩 $(df -B1 --output=avail / | tail -1) /mnt剩 $(df -B1 --output=avail /mnt | tail -1)"; sleep 30; done > /tmp/dflog 2>&1) &
+          DFPID=$!
+          # 实时遥测：每60秒把 df + Unity 日志尾部提交到仓库 .ci/live-status.txt（runner 被杀数据也已入库）
+          monitor() {
+            while true; do
+              {
+                date -u +"%FT%TZ"
+                df -h / /mnt
+                echo "--- build.log.live 尾部 ---"
+                tail -c 900 build.log.live 2>/dev/null || echo "(尚无)"
+              } > /tmp/status.txt 2>&1
+              B64=$(base64 -w0 /tmp/status.txt)
+              SHA=$(curl -s -H "Authorization: Bearer $TELE_TOKEN" \
+                "https://api.github.com/repos/huangwenjun0802-dotcom/moon-sweepers-android/contents/.ci/live-status.txt?ref=main" \
+                | python3 -c "import json,sys;print(json.load(sys.stdin).get('sha',''))" 2>/dev/null || true)
+              if [ -n "$SHA" ]; then
+                curl -s -X PUT -H "Authorization: Bearer $TELE_TOKEN" \
+                  "https://api.github.com/repos/huangwenjun0802-dotcom/moon-sweepers-android/contents/.ci/live-status.txt" \
+                  -d "{\"message\":\"telemetry\",\"content\":\"$B64\",\"sha\":\"$SHA\",\"branch\":\"main\"}" > /dev/null || true
+              else
+                curl -s -X PUT -H "Authorization: Bearer $TELE_TOKEN" \
+                  "https://api.github.com/repos/huangwenjun0802-dotcom/moon-sweepers-android/contents/.ci/live-status.txt" \
+                  -d "{\"message\":\"telemetry\",\"content\":\"$B64\",\"branch\":\"main\"}" > /dev/null || true
+              fi
+              sleep 60
+            done
+          }
+          monitor &
+          MONPID=$!
+          sudo mkdir -p /mnt/ctmp && sudo chmod 777 /mnt/ctmp
+          docker run --rm \
+            --shm-size=2g --ipc=host \
+            -v "$PWD":/project -w /project \
+            -v /mnt/ctmp:/ctmp \
+            -e TMPDIR=/ctmp \
+            -e UNITY_EMAIL -e UNITY_PASSWORD \
+            unityci/editor:ubuntu-6000.6.0f1-android-3 \
+            bash -c '
+              set -o pipefail
+              CLIENT="/opt/unity/Editor/Data/Resources/Licensing/Client/Unity.Licensing.Client"
+
+              echo "=== 1. 激活 Personal 席位 ==="
+              "$CLIENT" --activate-all --include-personal \
+                --username "$UNITY_EMAIL" --password "$UNITY_PASSWORD" 2>&1 | tee /tmp/activate.log
+              ACT_EXIT=${PIPESTATUS[0]}
+              if [ "$ACT_EXIT" -ne 0 ]; then
+                echo "##[error]Personal 席位激活失败 (exit $ACT_EXIT)，日志见上"
+                tail -30 /tmp/activate.log
+                exit 10
+              fi
+              grep -qiE "Activation processed successfully|Serial number assigned" /tmp/activate.log || {
+                echo "##[error]激活命令成功但未见席位授予标记"; exit 11; }
+              echo "=== 席位已获取 ==="
+
+              echo "=== 2. 编译 APK ==="
+              (while true; do cp /tmp/build.log /project/build.log.live 2>/dev/null || true; sleep 30; done) &
+              xvfb-run -a unity-editor \
+                -batchmode -nographics -quit \
+                -projectPath /project \
+                -job-worker-count 3 \
+                -executeMethod BuildAndroid.PerformBuild \
+                -logFile /tmp/build.log
+              BUILD_EXIT=$?
+              echo "=== build exit: $BUILD_EXIT ==="
+              echo "=== Gradle 失败详情 ==="
+              grep -B2 -A30 "What went wrong" /tmp/build.log || true
+              echo "=== lint 报告 ==="
+              find /project/build -name "lint*" -path "*report*" 2>/dev/null | head -5
+              grep -rE "Lint found [0-9]+ errors|Error: " /tmp/build.log | grep -viE "warning|no error" | head -20 || true
+              echo "=== CS 编译错误 ==="
+              grep -E "error CS[0-9]+" /tmp/build.log | head -30 || echo "(无 CS 错误)"
+              echo "=== Exception / 错误汇总 ==="
+              grep -nE "Exception|error|failed|Aborting|corrupt|missing" /tmp/build.log | grep -viE "warning|ErrorLog|no error" | tail -50 || true
+              echo "=== 日志尾部 120 行 ==="
+              tail -120 /tmp/build.log
+              cp /tmp/build.log /project/build.log || true
+
+              echo "=== 3.4 容器内磁盘水位 ==="
+              df -h / /mnt || true
+
+              echo "=== 3.5 打包 Unity 引用程序集（供本地编译） ==="
+              tar czf /project/unity-refs.tgz \
+                -C /opt/unity/Editor/Data \
+                Managed/UnityEngine Managed/UnityEngine.dll Managed/UnityEditor.dll \
+                -C /project Library/ScriptAssemblies 2>/dev/null || true
+              ls -la /project/unity-refs.tgz || true
+
+              echo "=== 3. 归还席位（无论成败）==="
+              xvfb-run -a unity-editor -batchmode -nographics -quit \
+                -returnlicense -username "$UNITY_EMAIL" -password "$UNITY_PASSWORD" \
+                -logFile /tmp/return.log 2>&1 | tail -3 || true
+              grep -qiE "Successfully returned the entitlement license|Successfully returned ULF" /tmp/return.log \
+                || { grep -iE "licensing|return" /tmp/return.log | tail -10; }
+              echo "=== return log ==="
+              tail -20 /tmp/return.log
+
+              [ "$BUILD_EXIT" -eq 0 ] || exit 20
+            '
+            kill $DFPID 2>/dev/null || true
+            kill $MONPID 2>/dev/null || true
+            sudo docker system prune -af --volumes > /dev/null 2>&1 || true
+            echo "=== 磁盘水位曲线（每30秒采样，最后30条） ==="
+            tail -30 /tmp/dflog || true
+            df -h / /mnt || true
+      - name: Verify APK contents (structure / scenes / game classes / assets)
+        run: |
+          APK=$(ls build/*.apk | head -1)
+          echo "APK: $APK ($(du -h "$APK" | cut -f1))"
+          # 1) 场景与资源体积
+          unzip -l "$APK" | grep -E "level0|global-metadata|libil2cpp" || true
+          # 2) 游戏类是否编进 IL2CPP（global-metadata 字符串抽查）
+          META=$(unzip -p "$APK" assets/bin/Data/Managed/Metadata/global-metadata.dat | strings)
+          for cls in MoonWorld MoonCleaners MoonSteamInput MoonInput MoonDepotBuilder; do
+            echo -n "$cls: "; echo "$META" | grep -c "^$cls$" || echo 0
+          done
+          # 3) 打包进 APK 的游戏资源计数
+          echo "APK 内 assets 总数: $(unzip -l "$APK" | grep -c 'assets/')"
+      - name: 发布 APK/日志到私有仓库 Release
+        if: always()
+        env:
+          TELE_TOKEN: ${{ secrets.UPLOAD_PAT }}
+        run: |
+          NOTE="${{ github.event.inputs.note }}"
+          TAG="ci-${{ github.run_id }}${NOTE:+-$NOTE}"
+          APK=$(ls build/*.apk 2>/dev/null | head -1)
+          REFS=$(ls unity-refs.tgz 2>/dev/null | head -1)
+          REL=$(curl -s -X POST -H "Authorization: token $TELE_TOKEN" -H "Content-Type: application/json" \
+            -d "{\"tag_name\":\"$TAG\",\"name\":\"$TAG\",\"body\":\"Unity CI public free runner, run ${{ github.run_id }}\"}" \
+            https://api.github.com/repos/huangwenjun0802-dotcom/moon-sweepers-android/releases)
+          RELID=$(echo "$REL" | python3 -c "import json,sys;print(json.load(sys.stdin).get('id',''))")
+          echo "release id=$RELID"
+          up(){ curl -s -X POST -H "Authorization: token $TELE_TOKEN" -H "Content-Type: application/octet-stream" --data-binary "@$1" "https://uploads.github.com/repos/huangwenjun0802-dotcom/moon-sweepers-android/releases/$RELID/assets?name=$2" | head -c 300; echo; }
+          [ -n "$APK" ] && up "$APK" "MoonSweepers-$TAG.apk"
+          [ -f build.log ] && up build.log "build-log-$TAG.txt"
+          [ -n "$REFS" ] && up "$REFS" "unity-refs-$TAG.tgz"
+          echo "=== 产物目录 ==="; ls -la build/ 2>/dev/null || true
