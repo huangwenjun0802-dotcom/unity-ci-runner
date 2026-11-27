@@ -62,6 +62,9 @@ jobs:
             fi
           done
           cp tools/shaders/TMPro_Properties.cginc Assets/Shader/ 2>/dev/null || true
+          # v41: TMP 官方名 shader 无条件进包（TMP_FontAsset.CreateFontAsset 运行时依赖）
+          cp "tools/shaders/TextMeshPro_Distance Field.shader" Assets/Shader/
+          cp "tools/shaders/TextMeshPro_MobileDF_Official.shader" Assets/Shader/
           echo "覆盖完成，缺失数=$MISS"
           head -8 "Assets/Shader/Moon Cleaners_Lunar Rock.shader"
       - name: Build in Unity container (activate -> build -> return seat)
