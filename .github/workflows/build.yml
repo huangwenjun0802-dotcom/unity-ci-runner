@@ -40,7 +40,19 @@ jobs:
           ENGINE_URL: ${{ secrets.ENGINE_ZIP_URL }}
           EXPORT_URL: ${{ secrets.EXPORT_ZIP_URL }}
         run: |
-          curl -sL --retry 3 "$ENGINE_URL" -o /tmp/ms-engine.zip
+          # v53: 工程包改走 GitHub Release 直传（CDN 大包下载连续 exit 35/55 网络失败）
+          EID=$(curl -s -H "Authorization: Bearer ${{ secrets.UPLOAD_PAT }}" \
+            "https://api.github.com/repos/huangwenjun0802-dotcom/moon-sweepers-android/releases/tags/engine-latest" \
+            | python3 -c "import json,sys;a=json.load(sys.stdin).get('assets',[]);print(a[0]['id'] if a else '')")
+          if [ -n "$EID" ]; then
+            echo "engine asset id=$EID"
+            curl -sL --retry 3 -H "Authorization: Bearer ${{ secrets.UPLOAD_PAT }}" \
+              -H "Accept: application/octet-stream" \
+              -o /tmp/ms-engine.zip \
+              "https://api.github.com/repos/huangwenjun0802-dotcom/moon-sweepers-android/releases/assets/$EID"
+          else
+            curl -sL --retry 3 "$ENGINE_URL" -o /tmp/ms-engine.zip
+          fi
           # v41b: exported_project.zip 直接从私有仓库 Release 拉（工程真包；Secret URL 那个是 Steam 原版文件已弃用）
           AID=$(curl -s -H "Authorization: Bearer ${{ secrets.UPLOAD_PAT }}" \
             "https://api.github.com/repos/huangwenjun0802-dotcom/moon-sweepers-android/releases/tags/exported-project" \
