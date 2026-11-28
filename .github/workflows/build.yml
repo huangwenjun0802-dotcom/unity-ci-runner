@@ -142,6 +142,7 @@ jobs:
                 -batchmode -nographics -quit \
                 -projectPath /project \
                 -job-worker-count 3 \
+                -disableAssemblyUpdater \
                 -executeMethod BuildAndroid.PerformBuild \
                 -logFile /tmp/build.log
               BUILD_EXIT=$?
